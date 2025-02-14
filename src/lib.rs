@@ -1,4 +1,6 @@
-use std::{fmt::Debug, sync::Mutex};
+#![warn(clippy::nursery, clippy::pedantic)]
+
+use std::fmt::Debug;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -12,12 +14,16 @@ use gluesql_core::{
         Metadata, RowIter, Store, StoreMut, Transaction,
     },
 };
-use ring::aead::{Aad, LessSafeKey, Nonce, NonceSequence, UnboundKey};
+use ring::aead::{LessSafeKey, NonceSequence, UnboundKey};
+
+mod encdec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("[GlueqlEncryption] serialization error: {0}")]
     SerializationError(#[from] postcard::Error),
+    #[error("[GluesqlEncryption] inner store error: {0}")]
+    StoreError(#[from] GluesqlError),
     #[error("[GluesqlEncryption] encryption error")]
     EncryptionError,
     #[error("[GluesqlEncryption] invalid value")]
@@ -26,18 +32,20 @@ pub enum Error {
 
 impl From<ring::error::Unspecified> for Error {
     fn from(_: ring::error::Unspecified) -> Self {
-        Error::EncryptionError
+        Self::EncryptionError
     }
 }
 
 impl From<Error> for GluesqlError {
     fn from(error: Error) -> Self {
-        GluesqlError::StorageMsg(error.to_string())
+        Self::StorageMsg(error.to_string())
     }
 }
+
 pub struct EncryptedStore<S, NonceSeq: NonceSequence> {
     key: LessSafeKey,
-    nonce_sequence: Mutex<NonceSeq>,
+    /// Should be a random nonce sequence.
+    nonce_sequence: NonceSeq,
     store: S,
 }
 
@@ -53,105 +61,83 @@ impl<S, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
     pub fn new(store: S, key: UnboundKey, nonce_sequence: NonceSeq) -> Self {
         Self {
             key: LessSafeKey::new(key),
-            nonce_sequence: Mutex::new(nonce_sequence),
+            nonce_sequence,
             store,
         }
     }
+}
 
-    pub fn encrypt_value_in_place(&self, value: &mut Value) -> Result<(), Error> {
-        let nonce = self.nonce_sequence.lock().unwrap().advance()?;
+impl<S: Store + StoreMut, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
+    /// Change the key used for encryption.
+    /// Rewrites all the data in the store with the new key and a new nonce.
+    ///
+    /// You should be careful when using this method and create a backup of the data before calling it or begin a transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store fails to fetch, decrypt, or re-encrypt the data.
+    ///
+    /// You should revert to the backup and retry later if this happens.
+    pub async fn change_key(mut self, new_key: UnboundKey) -> Result<Self, Error> {
+        let new_key = LessSafeKey::new(new_key);
 
-        tracing::info!(nonce = ?nonce.as_ref(), "encrypting val with nonce");
+        // identify table names
+        let schemas = self.store.fetch_all_schemas().await?;
 
-        let mut encrypted = Vec::with_capacity(
-            self.key.algorithm().nonce_len()
-                + std::mem::size_of::<Value>()
-                + self.key.algorithm().tag_len(),
-        );
+        for schema in schemas {
+            let keys = self
+                .store
+                .scan_data(&schema.table_name)
+                .await?
+                .map(|r| r.map(|(k, _)| k))
+                .collect::<Vec<_>>()
+                .await;
 
-        encrypted.extend_from_slice(nonce.as_ref());
+            for key in keys {
+                let key = key?;
 
-        let mut encrypted = postcard::to_extend(value, encrypted)?;
+                let mut row = self
+                    .store
+                    .fetch_data(&schema.table_name, &key)
+                    .await?
+                    .ok_or(Error::InvalidValue)?;
 
-        let aad = Aad::from(*nonce.as_ref());
+                match row {
+                    DataRow::Map(ref mut row) => {
+                        for value in row.values_mut() {
+                            encdec::decrypt_value_in_place(&self.key, value)?;
 
-        let tag = self.key.seal_in_place_separate_tag(
-            nonce,
-            aad,
-            &mut encrypted[self.key.algorithm().nonce_len()..],
-        )?;
-
-        encrypted.extend_from_slice(tag.as_ref());
-
-        *value = Value::Bytea(encrypted);
-
-        Ok(())
-    }
-
-    pub fn encrypt_row_in_place(&self, row: &mut DataRow) -> Result<(), Error> {
-        match row {
-            DataRow::Vec(ref mut values) => {
-                for value in values {
-                    self.encrypt_value_in_place(value)?;
+                            encdec::encrypt_value_in_place(
+                                &new_key,
+                                &mut self.nonce_sequence,
+                                value,
+                            )?;
+                        }
+                    }
+                    DataRow::Vec(ref mut row) => {
+                        for value in row {
+                            if encdec::decrypt_value_in_place(&self.key, value)? {
+                                encdec::encrypt_value_in_place(
+                                    &new_key,
+                                    &mut self.nonce_sequence,
+                                    value,
+                                )?;
+                            };
+                        }
+                    }
                 }
-            }
-            DataRow::Map(ref mut values) => {
-                for value in values.values_mut() {
-                    self.encrypt_value_in_place(value)?
-                }
+
+                self.store
+                    .insert_data(&schema.table_name, vec![(key, row)])
+                    .await?;
             }
         }
 
-        Ok(())
-    }
-
-    pub fn decrypt_value_in_place(&self, value: &mut Value) -> Result<(), Error> {
-        tracing::info!("decrypting");
-        match value {
-            Value::Bytea(encrypted) => {
-                let mut decrypted = encrypted.clone();
-
-                let (nonce, ciphertext) = decrypted.split_at_mut(self.key.algorithm().nonce_len());
-
-                tracing::info!(nonce = ?nonce, "decrypting val with nonce");
-
-                let nonce = Nonce::try_assume_unique_for_key(nonce)?;
-                let aad = Aad::from(*nonce.as_ref());
-
-                self.key.open_in_place(nonce, aad, ciphertext)?;
-
-                *value = postcard::from_bytes(ciphertext)?;
-
-                Ok(())
-            }
-            v => {
-                tracing::warn!(?v, "invalid value");
-
-                Ok(())
-            }
-        }
-    }
-
-    pub fn decrypt_row_in_place(&self, row: &mut DataRow) -> Result<(), Error> {
-        match row {
-            DataRow::Vec(ref mut values) => {
-                for value in values {
-                    self.decrypt_value_in_place(value)?;
-                }
-            }
-            DataRow::Map(ref mut values) => {
-                for value in values.values_mut() {
-                    self.decrypt_value_in_place(value)?
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn handle_column(&self, column: &mut ColumnDef) -> Result<ColumnDef> {
-        //TODO: handle default column values
-        todo!()
+        Ok(Self {
+            key: new_key,
+            nonce_sequence: self.nonce_sequence,
+            store: self.store,
+        })
     }
 }
 
@@ -171,8 +157,7 @@ impl<S: Store, NonceSeq: NonceSequence> Store for EncryptedStore<S, NonceSeq> {
         match data {
             Some(mut data) => {
                 tracing::info!(?data);
-                self.decrypt_row_in_place(&mut data)
-                    .map_err(GluesqlError::from)?;
+                encdec::decrypt_row_in_place(&self.key, &mut data).map_err(GluesqlError::from)?;
                 Ok(Some(data))
             }
             None => Ok(None),
@@ -183,8 +168,9 @@ impl<S: Store, NonceSeq: NonceSequence> Store for EncryptedStore<S, NonceSeq> {
         match self.store.scan_data(table_name).await {
             Ok(rows) => Ok(Box::pin(rows.map(|row| match row {
                 Ok((key, mut row)) => {
-                    self.decrypt_row_in_place(&mut row)
+                    encdec::decrypt_row_in_place(&self.key, &mut row)
                         .map_err(GluesqlError::from)?;
+
                     Ok((key, row))
                 }
                 Err(e) => Err(e),
@@ -211,8 +197,9 @@ impl<S: StoreMut, NonceSeq: NonceSequence> StoreMut for EncryptedStore<S, NonceS
     async fn append_data(&mut self, table_name: &str, mut rows: Vec<DataRow>) -> Result<()> {
         tracing::info!("appending");
 
-        for row in rows.iter_mut() {
-            self.encrypt_row_in_place(row).map_err(GluesqlError::from)?;
+        for row in &mut rows {
+            encdec::encrypt_row_in_place(&self.key, &mut self.nonce_sequence, row)
+                .map_err(GluesqlError::from)?;
         }
 
         tracing::info!(?rows);
@@ -223,8 +210,9 @@ impl<S: StoreMut, NonceSeq: NonceSequence> StoreMut for EncryptedStore<S, NonceS
     async fn insert_data(&mut self, table_name: &str, mut rows: Vec<(Key, DataRow)>) -> Result<()> {
         tracing::info!(?rows, %table_name, "inserting");
 
-        for (_, ref mut row) in rows.iter_mut() {
-            self.encrypt_row_in_place(row).map_err(GluesqlError::from)?;
+        for (_, ref mut row) in &mut rows {
+            encdec::encrypt_row_in_place(&self.key, &mut self.nonce_sequence, row)
+                .map_err(GluesqlError::from)?;
         }
 
         self.store.insert_data(table_name, rows).await
@@ -277,9 +265,22 @@ impl<S: Index, NonceSeq: NonceSequence> Index for EncryptedStore<S, NonceSeq> {
         asc: Option<bool>,
         cmp_value: Option<(&IndexOperator, Value)>,
     ) -> Result<RowIter<'_>> {
-        self.store
+        match self
+            .store
             .scan_indexed_data(table_name, index_name, asc, cmp_value)
             .await
+        {
+            Ok(rows) => Ok(Box::pin(rows.map(|row| match row {
+                Ok((key, mut row)) => {
+                    encdec::decrypt_row_in_place(&self.key, &mut row)
+                        .map_err(GluesqlError::from)?;
+
+                    Ok((key, row))
+                }
+                Err(e) => Err(e),
+            }))),
+            Err(e) => Err(e),
+        }
     }
 }
 

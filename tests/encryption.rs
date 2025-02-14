@@ -1,59 +1,31 @@
 use {
-    async_trait::async_trait,
-    futures::stream::TryStreamExt,
-    gluesql_core::{prelude::Glue, store::RowIter},
-    gluesql_encryption::EncryptedStore,
-    gluesql_memory_storage::MemoryStorage,
-    gluesql_test_suite::*,
-    ring::aead::{Nonce, NonceSequence, UnboundKey},
+    async_trait::async_trait, futures::stream::TryStreamExt, gluesql_core::prelude::Glue,
+    gluesql_encryption::EncryptedStore, gluesql_memory_storage::MemoryStorage,
+    gluesql_test_suite::*, ring::aead::UnboundKey, test_utils::RandNonce,
 };
 
-struct CounterNonce(u64);
-
-impl CounterNonce {
-    fn new() -> Self {
-        let _ = tracing_subscriber::fmt::try_init();
-
-        CounterNonce(0)
-    }
-}
-
-impl Default for CounterNonce {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl NonceSequence for CounterNonce {
-    fn advance(&mut self) -> Result<Nonce, ring::error::Unspecified> {
-        self.0 += 1;
-        let mut buf = [0; 12];
-        buf[..8].copy_from_slice(&self.0.to_le_bytes());
-        Ok(Nonce::assume_unique_for_key(buf))
-    }
-}
-
-fn new_key() -> UnboundKey {
-    let algorithm = &ring::aead::AES_256_GCM;
-    let key_bytes = &[0; 32];
-    UnboundKey::new(algorithm, key_bytes).unwrap()
-}
+#[path = "../src/test_utils.rs"]
+mod test_utils;
 
 struct EncryptedTester {
-    glue: Glue<EncryptedStore<MemoryStorage, CounterNonce>>,
+    glue: Glue<EncryptedStore<MemoryStorage, RandNonce>>,
 }
 
 #[async_trait(?Send)]
-impl Tester<EncryptedStore<MemoryStorage, CounterNonce>> for EncryptedTester {
+impl Tester<EncryptedStore<MemoryStorage, RandNonce>> for EncryptedTester {
     async fn new(_: &str) -> Self {
         let storage = MemoryStorage::default();
 
-        let glue = Glue::new(EncryptedStore::new(storage, new_key(), CounterNonce::new()));
+        let glue = Glue::new(EncryptedStore::new(
+            storage,
+            test_utils::new_key(),
+            RandNonce::new(),
+        ));
 
         EncryptedTester { glue }
     }
 
-    fn get_glue(&mut self) -> &mut Glue<EncryptedStore<MemoryStorage, CounterNonce>> {
+    fn get_glue(&mut self) -> &mut Glue<EncryptedStore<MemoryStorage, RandNonce>> {
         &mut self.glue
     }
 }
@@ -85,7 +57,11 @@ async fn memory_storage_index() {
         store::{Index, Store},
     };
 
-    let storage = MemoryStorage::default();
+    let storage = EncryptedStore::new(
+        MemoryStorage::default(),
+        test_utils::new_key(),
+        RandNonce::new(),
+    );
 
     assert_eq!(
         Store::scan_data(&storage, "Idx")
@@ -125,11 +101,24 @@ async fn memory_storage_index() {
 async fn memory_storage_transaction() {
     use gluesql_core::prelude::{Error, Glue, Payload};
 
-    let storage = MemoryStorage::default();
+    let storage = EncryptedStore::new(
+        MemoryStorage::default(),
+        test_utils::new_key(),
+        RandNonce::new(),
+    );
     let mut glue = Glue::new(storage);
 
     exec!(glue "CREATE TABLE TxTest (id INTEGER);");
     test!(glue "BEGIN", Err(Error::StorageMsg("[MemoryStorage] transaction is not supported".to_owned())));
     test!(glue "COMMIT", Ok(vec![Payload::Commit]));
     test!(glue "ROLLBACK", Ok(vec![Payload::Rollback]));
+
+    exec!(glue "INSERT INTO TxTest (id) VALUES (1);");
+    glue.storage = glue
+        .storage
+        .change_key(UnboundKey::new(&ring::aead::AES_256_GCM, &[1; 32]).unwrap())
+        .await
+        .unwrap();
+
+    tracing::info!(a = ?glue.execute("SELECT * FROM TxTest;").await.unwrap());
 }
