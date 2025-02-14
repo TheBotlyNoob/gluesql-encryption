@@ -1,0 +1,23 @@
+[package]
+name = "gluesql-encryption"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1.85"
+futures = "0.3.31"
+gluesql-core = "0.16.3"
+postcard = { version = "1.1.1", features = ["alloc"] }
+ring = { version = "0.17.8", default-features = false }
+serde = "1.0.217"
+thiserror = "2.0.11"
+tracing = "0.1.41"
+
+[dev-dependencies]
+tokio = { version = "1.43.0", features = [
+    "rt-multi-thread",
+    "macros",
+], default-features = false }
+gluesql_memory_storage = "0.16.3"
+tracing-subscriber = "0.3"
+gluesql-test-suite = "0.16.3"
