@@ -7,7 +7,7 @@ edition = "2021"
 async-trait = "0.1.85"
 futures = "0.3.31"
 gluesql-core = "0.16.3"
-postcard = { version = "1.1.1", features = ["alloc"] }
+postcard = { version = "1.1.1", default-features = false }
 ring = { version = "0.17.8", default-features = false }
 serde = "1.0.217"
 thiserror = "2.0.11"
