@@ -1,6 +1,6 @@
 #![warn(clippy::nursery, clippy::pedantic)]
 
-use std::fmt::Debug;
+use std::{collections::HashMap, fmt::Debug};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -20,7 +20,11 @@ mod encdec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("[GlueqlEncryption] serialization error: {0}")]
+    #[error("[GlueqlEncryption] attempted to use EncryptedStore with a non-encrypted database")]
+    NonEncryptedDatabase,
+    #[error("[GluesqlEncryption] invalid key")]
+    InvalidKey,
+    #[error("[GluesqlEncryption] serialization error: {0}")]
     SerializationError(#[from] postcard::Error),
     #[error("[GluesqlEncryption] inner store error: {0}")]
     StoreError(#[from] GluesqlError),
@@ -57,14 +61,30 @@ impl<S: Debug, NonceSeq: NonceSequence> Debug for EncryptedStore<S, NonceSeq> {
     }
 }
 
-impl<S, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
-    pub fn new(store: S, key: UnboundKey, nonce_sequence: NonceSeq) -> Self {
-        Self {
+impl<S: Store + StoreMut, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
+    /// Creates the `EncryptedStore` with the given store, key, and nonce sequence.
+    ///
+    /// Additionally creates the `encrypted_meta` table in the store if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store fails to fetch the schema or insert the schema.
+    pub async fn new(store: S, key: UnboundKey, nonce_sequence: NonceSeq) -> Result<Self, Error> {
+        if let Some(table) = store.fetch_data("encrypted_meta", &Key::U8(0)).await? {
+            match table {
+                DataRow::Map(map) => {}
+                _ => return Err(Error::InvalidValue),
+            }
+        }
+
+        Ok(Self {
             key: LessSafeKey::new(key),
             nonce_sequence,
             store,
-        }
+        })
     }
+
+    // fn check_key(table: HashMap<String, >)
 }
 
 impl<S: Store + StoreMut, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
