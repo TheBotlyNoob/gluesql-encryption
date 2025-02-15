@@ -1,11 +1,11 @@
 #![warn(clippy::nursery, clippy::pedantic)]
 
-use std::{collections::HashMap, fmt::Debug};
+use std::fmt::Debug;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use gluesql_core::{
-    ast::{ColumnDef, IndexOperator, OrderByExpr},
+    ast::{ColumnDef, DataType, IndexOperator, OrderByExpr},
     data::{CustomFunction as StructCustomFunction, Key, Schema, Value},
     error::{Error as GluesqlError, Result},
     executor::Referencing,
@@ -18,7 +18,7 @@ use ring::aead::{LessSafeKey, NonceSequence, UnboundKey};
 
 mod encdec;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {
     #[error("[GlueqlEncryption] attempted to use EncryptedStore with a non-encrypted database")]
     NonEncryptedDatabase,
@@ -61,6 +61,13 @@ impl<S: Debug, NonceSeq: NonceSequence> Debug for EncryptedStore<S, NonceSeq> {
     }
 }
 
+impl<S, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
+    /// Returns the inner store.
+    pub fn into_inner(self) -> S {
+        self.store
+    }
+}
+
 impl<S: Store + StoreMut, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
     /// Creates the `EncryptedStore` with the given store, key, and nonce sequence.
     ///
@@ -69,19 +76,84 @@ impl<S: Store + StoreMut, NonceSeq: NonceSequence> EncryptedStore<S, NonceSeq> {
     /// # Errors
     ///
     /// Returns an error if the store fails to fetch the schema or insert the schema.
-    pub async fn new(store: S, key: UnboundKey, nonce_sequence: NonceSeq) -> Result<Self, Error> {
+    pub async fn new(
+        mut store: S,
+        key: UnboundKey,
+        mut nonce_sequence: NonceSeq,
+    ) -> Result<Self, Error> {
+        let key = LessSafeKey::new(key);
+
         if let Some(table) = store.fetch_data("encrypted_meta", &Key::U8(0)).await? {
             match table {
-                DataRow::Map(map) => {}
-                _ => return Err(Error::InvalidValue),
+                DataRow::Map(mut map) => {
+                    let encrypted_key = map.get_mut("key").ok_or(Error::InvalidValue)?;
+
+                    if encdec::decrypt_value_in_place(&key, encrypted_key).is_err() {
+                        return Err(Error::InvalidKey);
+                    };
+                }
+                DataRow::Vec(_) => return Err(Error::InvalidValue),
             }
+        } else {
+            store
+                .insert_schema(&Schema {
+                    table_name: "encrypted_meta".to_string(),
+                    column_defs: Some(vec![ColumnDef {
+                        name: "key".to_string(),
+                        data_type: DataType::Bytea,
+                        nullable: false,
+                        default: None,
+                        unique: None,
+                        comment: None,
+                    }]),
+                    indexes: vec![],
+                    engine: None,
+                    foreign_keys: vec![],
+                    comment: Some("Table to store the EncryptedStore metadata".to_string()),
+                })
+                .await?;
+
+            store
+                .insert_data(
+                    "encrypted_meta",
+                    vec![(
+                        Key::U8(0),
+                        DataRow::Map(
+                            vec![("key".to_string(), {
+                                let mut value = Value::Null;
+
+                                encdec::encrypt_value_in_place(
+                                    &key,
+                                    &mut nonce_sequence,
+                                    &mut value,
+                                )?;
+
+                                value
+                            })]
+                            .into_iter()
+                            .collect(),
+                        ),
+                    )],
+                )
+                .await?;
         }
 
         Ok(Self {
-            key: LessSafeKey::new(key),
+            key,
             nonce_sequence,
             store,
         })
+    }
+
+    /// Creates the `EncryptedStore` with the given store, key, and nonce sequence.
+    ///
+    /// Does not check for a correct key. If the key is invalid, the store will return an error when fetching data.
+    pub fn new_unchecked(store: S, key: UnboundKey, nonce_sequence: NonceSeq) -> Self {
+        Self {
+            key: LessSafeKey::new(key),
+            nonce_sequence,
+            store,
+        }
     }
 
     // fn check_key(table: HashMap<String, >)

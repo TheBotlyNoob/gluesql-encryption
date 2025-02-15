@@ -28,7 +28,7 @@ pub fn bench_insert(c: &mut Criterion) {
         .mode(sled::Mode::HighThroughput);
 
     let storage = SledStorage::try_from(config).unwrap();
-    let mut glue = Glue::new(EncryptedStore::new(
+    let mut glue = Glue::new(EncryptedStore::new_unchecked(
         storage,
         test_utils::new_key(),
         RandNonce::new(),
@@ -75,7 +75,7 @@ pub fn bench_select(c: &mut Criterion) {
         .mode(sled::Mode::HighThroughput);
 
     let storage = SledStorage::try_from(config).unwrap();
-    let mut glue = Glue::new(EncryptedStore::new(
+    let mut glue = Glue::new(EncryptedStore::new_unchecked(
         storage,
         test_utils::new_key(),
         RandNonce::new(),
